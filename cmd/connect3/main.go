@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 
 	"github.com/N3moAhead/connect3/internal/config"
@@ -46,8 +48,9 @@ const (
 // --- MAIN MODEL ---
 
 type model struct {
-	state sessionState
-	db    db.Database
+	state  sessionState
+	db     db.Database
+	dbPath string
 
 	// Lists
 	listPeople    list.Model
@@ -66,16 +69,32 @@ type model struct {
 	inputRelStr  textinput.Model
 }
 
-func initialModel() model {
-	db := loadData()
+func getDefaultDBPath() string {
+	// Try XDG_DATA_HOME
+	xdgData := os.Getenv("XDG_DATA_HOME")
+	if xdgData != "" {
+		return filepath.Join(xdgData, "connect3", config.DB_FILE_NAME)
+	}
+
+	// Fallback to ~/.local/share
+	home, err := os.UserHomeDir()
+	if err != nil {
+		// Last resort fallback
+		return "data.json"
+	}
+	return filepath.Join(home, ".local", "share", "connect3", config.DB_FILE_NAME)
+}
+
+func initialModel(dbPath string) model {
+	database := loadData(dbPath)
 
 	// 1. Init People List
-	items := make([]list.Item, len(db.People))
-	for i, p := range db.People {
+	items := make([]list.Item, len(database.People))
+	for i, p := range database.People {
 		items[i] = p
 	}
 	l := list.New(items, list.NewDefaultDelegate(), 0, 0)
-	l.Title = "People"
+	l.Title = "Connect3"
 	l.AdditionalShortHelpKeys = func() []key.Binding {
 		return []key.Binding{
 			key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "New Person")),
@@ -108,7 +127,8 @@ func initialModel() model {
 
 	return model{
 		state:         viewListPeople,
-		db:            db,
+		db:            database,
+		dbPath:        dbPath,
 		listPeople:    l,
 		listRelations: lr,
 		inputName:     ti,
@@ -273,7 +293,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					m.db.People = append(m.db.People, newP)
 				}
-				saveData(m.db)
+				saveData(m.db, m.dbPath)
 				m.listPeople.SetItems(peopleToItems(m.db.People))
 
 				if m.isEditing {
@@ -314,7 +334,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.db.People = newPeople
 
-				saveData(m.db)
+				saveData(m.db, m.dbPath)
 				m.listPeople.SetItems(peopleToItems(m.db.People))
 				m.state = viewListPeople
 				m.selectedPerson = nil
@@ -408,7 +428,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					m.db.Relations = append(m.db.Relations, newRel)
 				}
-				saveData(m.db)
+				saveData(m.db, m.dbPath)
 				m.refreshRelationList()
 				m.state = viewDetail
 				m.listPeople.Title = "People" // Reset Title if we came from target select
@@ -434,7 +454,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 				m.db.Relations = newRels
-				saveData(m.db)
+				saveData(m.db, m.dbPath)
 				m.refreshRelationList()
 				m.state = viewDetail
 			} else if msg.String() == "n" || msg.String() == "N" || msg.String() == "esc" {
@@ -569,8 +589,8 @@ func peopleToItems(people []person.Person) []list.Item {
 }
 
 // FIX: Automatically add IDs to old relations that don't have one
-func loadData() db.Database {
-	f, err := os.Open(config.DB_FILE_NAME)
+func loadData(dbPath string) db.Database {
+	f, err := os.Open(dbPath)
 	if err != nil {
 		return db.Database{People: []person.Person{}, Relations: []relation.Relation{}, Version: config.DB_FORMAT_VERSION}
 	}
@@ -589,19 +609,37 @@ func loadData() db.Database {
 	}
 	// If we fixed IDs, save back to disk immediately
 	if dirty {
-		saveData(database)
+		saveData(database, dbPath)
 	}
 
 	return database
 }
 
-func saveData(database db.Database) {
+func saveData(database db.Database, dbPath string) {
 	file, _ := json.MarshalIndent(database, "", " ")
-	_ = os.WriteFile(config.DB_FILE_NAME, file, 0644)
+	_ = os.WriteFile(dbPath, file, 0644)
 }
 
 func main() {
-	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
+	// Parse Flags
+	dbFlag := flag.String("db", "", "Path to the database json file")
+	flag.Parse()
+
+	// Determine path
+	dbPath := *dbFlag
+	if dbPath == "" {
+		dbPath = getDefaultDBPath()
+	}
+
+	// Ensure directory exists
+	dir := filepath.Dir(dbPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		fmt.Printf("Error creating directory %s: %v\n", dir, err)
+		os.Exit(1)
+	}
+
+	fmt.Println("Saving to:", dbPath)
+	p := tea.NewProgram(initialModel(dbPath), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error: %v", err)
 		os.Exit(1)
