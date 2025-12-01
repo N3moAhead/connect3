@@ -7,6 +7,10 @@ import (
 	"os"
 	"strconv"
 
+	"github.com/N3moAhead/connect3/internal/config"
+	"github.com/N3moAhead/connect3/internal/db"
+	"github.com/N3moAhead/connect3/internal/person"
+	"github.com/N3moAhead/connect3/internal/relation"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/textarea"
@@ -15,58 +19,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/google/uuid"
 )
-
-// --- DATA MODEL ---
-
-type Person struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
-	Notes string `json:"notes"`
-}
-
-// Implement list.Item interface
-func (p Person) Title() string       { return p.Name }
-func (p Person) Description() string { return p.Notes }
-func (p Person) FilterValue() string { return p.Name }
-
-type Relation struct {
-	ID          string `json:"id"`
-	FromID      string `json:"from_id"`
-	ToID        string `json:"to_id"`
-	Strength    int    `json:"strength"` // 1-5
-	Description string `json:"description"`
-}
-
-// Wrapper for Relation to be used in bubbles/list
-type RelationItem struct {
-	Rel       Relation
-	OtherName string
-	Direction string // "->" or "<-"
-}
-
-func (r RelationItem) Title() string {
-	icon := "⚪"
-	switch r.Rel.Strength {
-	case 2:
-		icon = "🔵"
-	case 3:
-		icon = "🟢"
-	case 4:
-		icon = "🟡"
-	case 5:
-		icon = "🔴"
-	}
-	return fmt.Sprintf("%s %s %s (%d/5)", icon, r.Direction, r.OtherName, r.Rel.Strength)
-}
-func (r RelationItem) Description() string { return r.Rel.Description }
-func (r RelationItem) FilterValue() string { return r.OtherName + " " + r.Rel.Description }
-
-type Database struct {
-	People    []Person   `json:"people"`
-	Relations []Relation `json:"relations"`
-}
-
-const dbFileName = "data.json"
 
 // --- STYLING ---
 
@@ -95,16 +47,16 @@ const (
 
 type model struct {
 	state sessionState
-	db    Database
+	db    db.Database
 
 	// Lists
 	listPeople    list.Model
 	listRelations list.Model // Embedded in Detail View
 
 	// Selections
-	selectedPerson *Person
-	selectedRel    *Relation
-	targetPerson   *Person // For creating new relations
+	selectedPerson *person.Person
+	selectedRel    *relation.Relation
+	targetPerson   *person.Person // For creating new relations
 
 	// Forms
 	isEditing    bool // Are we creating or editing?
@@ -182,10 +134,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.listPeople.SetSize(msg.Width-h, msg.Height-v)
 
 		// Relations list is smaller (subtract header space approx 10 lines)
-		relHeight := msg.Height - v - 12
-		if relHeight < 5 {
-			relHeight = 5
-		}
+		relHeight := max(msg.Height-v-12, 5)
 		m.listRelations.SetSize(msg.Width-h, relHeight)
 	}
 
@@ -206,7 +155,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.inputName.Focus()
 				return m, nil
 			case "enter":
-				if i, ok := m.listPeople.SelectedItem().(Person); ok {
+				if i, ok := m.listPeople.SelectedItem().(person.Person); ok {
 					m.selectedPerson = &i
 					m.state = viewDetail
 					// Refresh relation list items
@@ -251,7 +200,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "e":
 				// Edit selected relation
 				if len(m.listRelations.Items()) > 0 {
-					if i, ok := m.listRelations.SelectedItem().(RelationItem); ok {
+					if i, ok := m.listRelations.SelectedItem().(relation.RelationItem); ok {
 						m.selectedRel = &i.Rel
 						m.state = viewRelationForm
 						m.isEditing = true
@@ -264,7 +213,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "d":
 				// Delete selected relation
 				if len(m.listRelations.Items()) > 0 {
-					if i, ok := m.listRelations.SelectedItem().(RelationItem); ok {
+					if i, ok := m.listRelations.SelectedItem().(relation.RelationItem); ok {
 						m.selectedRel = &i.Rel
 						m.state = viewConfirmDeleteRelation
 					}
@@ -317,7 +266,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				} else {
 					// Create new
-					newP := Person{
+					newP := person.Person{
 						ID:    uuid.New().String(),
 						Name:  m.inputName.Value(),
 						Notes: m.inputNotes.Value(),
@@ -348,7 +297,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyMsg:
 			if msg.String() == "y" || msg.String() == "Y" {
 				// 1. Delete relations
-				newRels := []Relation{}
+				newRels := []relation.Relation{}
 				for _, r := range m.db.Relations {
 					if r.FromID != m.selectedPerson.ID && r.ToID != m.selectedPerson.ID {
 						newRels = append(newRels, r)
@@ -357,7 +306,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.db.Relations = newRels
 
 				// 2. Delete person
-				newPeople := []Person{}
+				newPeople := []person.Person{}
 				for _, p := range m.db.People {
 					if p.ID != m.selectedPerson.ID {
 						newPeople = append(newPeople, p)
@@ -386,7 +335,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			if msg.String() == "enter" {
-				if i, ok := m.listPeople.SelectedItem().(Person); ok {
+				if i, ok := m.listPeople.SelectedItem().(person.Person); ok {
 					if i.ID == m.selectedPerson.ID {
 						// Can't link to self
 						return m, nil
@@ -450,7 +399,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				} else {
 					// Create new relation
-					newRel := Relation{
+					newRel := relation.Relation{
 						ID:          uuid.New().String(),
 						FromID:      m.selectedPerson.ID,
 						ToID:        m.targetPerson.ID,
@@ -478,7 +427,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
 			if msg.String() == "y" || msg.String() == "Y" {
-				newRels := []Relation{}
+				newRels := []relation.Relation{}
 				for _, r := range m.db.Relations {
 					if r.ID != m.selectedRel.ID {
 						newRels = append(newRels, r)
@@ -591,7 +540,7 @@ func (m *model) refreshRelationList() {
 				direction = "<-"
 			}
 
-			items = append(items, RelationItem{
+			items = append(items, relation.RelationItem{
 				Rel:       r,
 				OtherName: getName(m.db.People, otherID),
 				Direction: direction,
@@ -602,7 +551,7 @@ func (m *model) refreshRelationList() {
 	m.listRelations.ResetSelected()
 }
 
-func getName(people []Person, id string) string {
+func getName(people []person.Person, id string) string {
 	for _, p := range people {
 		if p.ID == id {
 			return p.Name
@@ -611,7 +560,7 @@ func getName(people []Person, id string) string {
 	return "Unknown"
 }
 
-func peopleToItems(people []Person) []list.Item {
+func peopleToItems(people []person.Person) []list.Item {
 	items := make([]list.Item, len(people))
 	for i, p := range people {
 		items[i] = p
@@ -620,35 +569,35 @@ func peopleToItems(people []Person) []list.Item {
 }
 
 // FIX: Automatically add IDs to old relations that don't have one
-func loadData() Database {
-	f, err := os.Open(dbFileName)
+func loadData() db.Database {
+	f, err := os.Open(config.DB_FILE_NAME)
 	if err != nil {
-		return Database{People: []Person{}, Relations: []Relation{}}
+		return db.Database{People: []person.Person{}, Relations: []relation.Relation{}}
 	}
 	defer f.Close()
 	byteValue, _ := io.ReadAll(f)
-	var db Database
-	json.Unmarshal(byteValue, &db)
+	var database db.Database
+	json.Unmarshal(byteValue, &database)
 
 	// Migration: Ensure all relations have an ID
 	dirty := false
-	for i := range db.Relations {
-		if db.Relations[i].ID == "" {
-			db.Relations[i].ID = uuid.New().String()
+	for i := range database.Relations {
+		if database.Relations[i].ID == "" {
+			database.Relations[i].ID = uuid.New().String()
 			dirty = true
 		}
 	}
 	// If we fixed IDs, save back to disk immediately
 	if dirty {
-		saveData(db)
+		saveData(database)
 	}
 
-	return db
+	return database
 }
 
-func saveData(db Database) {
-	file, _ := json.MarshalIndent(db, "", " ")
-	_ = os.WriteFile(dbFileName, file, 0644)
+func saveData(database db.Database) {
+	file, _ := json.MarshalIndent(database, "", " ")
+	_ = os.WriteFile(config.DB_FILE_NAME, file, 0644)
 }
 
 func main() {
