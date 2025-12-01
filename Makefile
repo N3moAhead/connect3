@@ -14,3 +14,6 @@ run: build
 
 clean:
 	rm main
+
+reset:
+	rm data.json
