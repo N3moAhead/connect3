@@ -572,7 +572,7 @@ func peopleToItems(people []person.Person) []list.Item {
 func loadData() db.Database {
 	f, err := os.Open(config.DB_FILE_NAME)
 	if err != nil {
-		return db.Database{People: []person.Person{}, Relations: []relation.Relation{}}
+		return db.Database{People: []person.Person{}, Relations: []relation.Relation{}, Version: config.DB_FORMAT_VERSION}
 	}
 	defer f.Close()
 	byteValue, _ := io.ReadAll(f)

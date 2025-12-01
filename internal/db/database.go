@@ -8,4 +8,5 @@ import (
 type Database struct {
 	People    []person.Person     `json:"people"`
 	Relations []relation.Relation `json:"relations"`
+	Version   string              `json:"version"`
 }
