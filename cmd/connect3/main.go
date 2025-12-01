@@ -173,6 +173,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.inputName.SetValue("")
 				m.inputNotes.SetValue("")
 				m.inputName.Focus()
+				m.inputNotes.Blur()
 				return m, nil
 			case "enter":
 				if i, ok := m.listPeople.SelectedItem().(person.Person); ok {
@@ -205,6 +206,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.inputName.SetValue(m.selectedPerson.Name)
 				m.inputNotes.SetValue(m.selectedPerson.Notes)
 				m.inputName.Focus()
+				m.inputNotes.Blur()
 				return m, nil
 			case "D": // Shift+d to delete Person
 				m.state = viewConfirmDeletePerson
@@ -227,6 +229,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.inputRelDesc.SetValue(i.Rel.Description)
 						m.inputRelStr.SetValue(fmt.Sprintf("%d", i.Rel.Strength))
 						m.inputRelStr.Focus()
+						m.inputRelDesc.Blur()
 					}
 				}
 				return m, nil
@@ -364,6 +367,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.state = viewRelationForm
 					m.isEditing = false
 					m.inputRelStr.Focus()
+					m.inputRelDesc.Blur()
 					m.inputRelStr.SetValue("")
 					m.inputRelDesc.SetValue("")
 				}
