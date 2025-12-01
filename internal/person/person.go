@@ -1,9 +1,10 @@
 package person
 
 type Person struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
-	Notes string `json:"notes"`
+	ID    string   `json:"id"`
+	Name  string   `json:"name"`
+	Notes string   `json:"notes"`
+	Tags  []string `json:"tags"`
 }
 
 // Implement list.Item interface

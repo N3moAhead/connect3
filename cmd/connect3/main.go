@@ -7,10 +7,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/N3moAhead/connect3/internal/config"
 	"github.com/N3moAhead/connect3/internal/db"
+	"github.com/N3moAhead/connect3/internal/migration"
 	"github.com/N3moAhead/connect3/internal/person"
 	"github.com/N3moAhead/connect3/internal/relation"
 	"github.com/charmbracelet/bubbles/key"
@@ -29,6 +32,7 @@ var (
 	titleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true)
 	infoStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	warnStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true) // Red
+	tagStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("39")).MarginRight(1)
 )
 
 // --- APPLICATION STATES ---
@@ -43,6 +47,7 @@ const (
 	viewRelationForm   // Used for Create and Edit
 	viewConfirmDeletePerson
 	viewConfirmDeleteRelation
+	viewTagSelect
 )
 
 // --- MAIN MODEL ---
@@ -67,6 +72,11 @@ type model struct {
 	inputNotes   textarea.Model
 	inputRelDesc textinput.Model
 	inputRelStr  textinput.Model
+
+	// Tag Selection
+	listTags list.Model      // list of available tags
+	inputTag textinput.Model // Dedicated input for tags
+	tempTags []string        // list of tags which we are editing
 }
 
 func getDefaultDBPath() string {
@@ -79,7 +89,6 @@ func getDefaultDBPath() string {
 	// Fallback to ~/.local/share
 	home, err := os.UserHomeDir()
 	if err != nil {
-		// Last resort fallback
 		return "data.json"
 	}
 	return filepath.Join(home, ".local", "share", "connect3", config.DB_FILE_NAME)
@@ -105,9 +114,9 @@ func initialModel(dbPath string) model {
 	lr := list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0)
 	lr.Title = "Connections"
 	lr.SetShowTitle(false)
-	lr.SetFilteringEnabled(false) // Disable filter in detail view to keep it clean
-	lr.SetShowHelp(false)         // We show custom help in view
-	lr.SetShowStatusBar(false)    // Minimalist look
+	lr.SetFilteringEnabled(false)
+	lr.SetShowHelp(false)
+	lr.SetShowStatusBar(false)
 	lr.DisableQuitKeybindings()
 
 	// 3. Init Inputs
@@ -125,6 +134,19 @@ func initialModel(dbPath string) model {
 	tiRelStr.Placeholder = "Strength (1-5)"
 	tiRelStr.CharLimit = 1
 
+	// 4. Init Tag List & Input
+	initialTags := getAllUniqueTags(database.People)
+	lt := list.New(initialTags, list.NewDefaultDelegate(), 0, 0)
+	lt.SetShowTitle(false)
+	lt.SetShowStatusBar(false)
+	lt.SetFilteringEnabled(false) // Wir machen unser eigenes Filtering
+	lt.SetShowHelp(false)
+	lt.DisableQuitKeybindings()
+
+	tiTag := textinput.New()
+	tiTag.Placeholder = "Type to search or create new tag..."
+	tiTag.CharLimit = 30
+
 	return model{
 		state:         viewListPeople,
 		db:            database,
@@ -135,6 +157,9 @@ func initialModel(dbPath string) model {
 		inputNotes:    ta,
 		inputRelDesc:  tiRelDesc,
 		inputRelStr:   tiRelStr,
+		listTags:      lt,
+		inputTag:      tiTag,
+		tempTags:      []string{},
 	}
 }
 
@@ -149,13 +174,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		// CRITICAL FIX: Update sizes for BOTH lists regardless of current view
 		h, v := docStyle.GetFrameSize()
 		m.listPeople.SetSize(msg.Width-h, msg.Height-v)
 
-		// Relations list is smaller (subtract header space approx 10 lines)
 		relHeight := max(msg.Height-v-12, 5)
 		m.listRelations.SetSize(msg.Width-h, relHeight)
+
+		tagListH := msg.Height - v - 6
+		if tagListH < 1 {
+			tagListH = 1
+		}
+		m.listTags.SetSize(msg.Width-h, tagListH)
 	}
 
 	switch m.state {
@@ -168,6 +197,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case tea.KeyMsg:
 			switch msg.String() {
 			case "n":
+				m.tempTags = []string{}
 				m.state = viewPersonForm
 				m.isEditing = false
 				m.inputName.SetValue("")
@@ -179,7 +209,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if i, ok := m.listPeople.SelectedItem().(person.Person); ok {
 					m.selectedPerson = &i
 					m.state = viewDetail
-					// Refresh relation list items
 					m.refreshRelationList()
 				}
 				return m, nil
@@ -189,18 +218,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 
 	// ---------------------------------------------------------
-	// 2. DETAIL VIEW (Contains Info + Relations List)
+	// 2. DETAIL VIEW
 	// ---------------------------------------------------------
 	case viewDetail:
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
-			// Global Detail Keys
 			switch msg.String() {
 			case "esc", "backspace":
 				m.state = viewListPeople
 				m.selectedPerson = nil
 				return m, nil
-			case "E": // Shift+e to edit Person
+			case "E": // Edit Person
+				m.tempTags = m.selectedPerson.Tags
 				m.state = viewPersonForm
 				m.isEditing = true
 				m.inputName.SetValue(m.selectedPerson.Name)
@@ -208,19 +237,32 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.inputName.Focus()
 				m.inputNotes.Blur()
 				return m, nil
-			case "D": // Shift+d to delete Person
+
+			// --- Ctrl+g für Tags ---
+			case "ctrl+g":
+				m.tempTags = m.selectedPerson.Tags
+				m.isEditing = true
+				m.inputName.SetValue(m.selectedPerson.Name)
+				m.inputNotes.SetValue(m.selectedPerson.Notes)
+
+				// Reset Tag View
+				m.inputTag.SetValue("")
+				m.inputTag.Focus()
+				m.updateTagListFilter() // Initial list population
+				m.state = viewTagSelect
+				return m, nil
+
+			case "D": // Delete Person
 				m.state = viewConfirmDeletePerson
 				return m, nil
 
-			// Relation List Keys
+			// Relation Logic
 			case "n":
-				// Add new relation
 				m.state = viewRelationTarget
 				m.listPeople.Title = "Select person to connect with " + m.selectedPerson.Name
 				m.listPeople.ResetSelected()
 				return m, nil
 			case "e":
-				// Edit selected relation
 				if len(m.listRelations.Items()) > 0 {
 					if i, ok := m.listRelations.SelectedItem().(relation.RelationItem); ok {
 						m.selectedRel = &i.Rel
@@ -234,7 +276,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				return m, nil
 			case "d":
-				// Delete selected relation
 				if len(m.listRelations.Items()) > 0 {
 					if i, ok := m.listRelations.SelectedItem().(relation.RelationItem); ok {
 						m.selectedRel = &i.Rel
@@ -244,12 +285,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		}
-		// Forward keys to the relations list (navigation)
 		m.listRelations, cmd = m.listRelations.Update(msg)
 		return m, cmd
 
 	// ---------------------------------------------------------
-	// 3. PERSON FORM (Create / Edit)
+	// 3. PERSON FORM
 	// ---------------------------------------------------------
 	case viewPersonForm:
 		switch msg := msg.(type) {
@@ -270,6 +310,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.inputNotes.Blur()
 					m.inputName.Focus()
 				}
+				return m, nil
+
+			// --- Ctrl+g für Tags ---
+			case "ctrl+g":
+				m.inputTag.SetValue("")
+				m.inputTag.Focus()
+				m.updateTagListFilter()
+				m.state = viewTagSelect
+
+				m.inputName.Blur()
+				m.inputNotes.Blur()
+				return m, nil
+
 			case "enter":
 				if m.inputName.Focused() {
 					m.inputName.Blur()
@@ -278,21 +331,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				// Save Logic
 				if m.isEditing {
-					// Update existing
 					for i, p := range m.db.People {
 						if p.ID == m.selectedPerson.ID {
 							m.db.People[i].Name = m.inputName.Value()
 							m.db.People[i].Notes = m.inputNotes.Value()
-							m.selectedPerson = &m.db.People[i] // Update pointer
+							m.db.People[i].Tags = m.tempTags
+							m.selectedPerson = &m.db.People[i]
 							break
 						}
 					}
 				} else {
-					// Create new
 					newP := person.Person{
 						ID:    uuid.New().String(),
 						Name:  m.inputName.Value(),
 						Notes: m.inputNotes.Value(),
+						Tags:  m.tempTags,
 					}
 					m.db.People = append(m.db.People, newP)
 				}
@@ -313,13 +366,65 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(cmdName, cmdNotes)
 
 	// ---------------------------------------------------------
-	// 4. CONFIRM DELETE PERSON
+	// 4. TAG SELECTION VIEW
+	// ---------------------------------------------------------
+	case viewTagSelect:
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			switch msg.String() {
+			case "esc":
+				m.state = viewPersonForm
+				m.inputName.Focus()
+				return m, nil
+
+			case "down", "up":
+				m.listTags, cmd = m.listTags.Update(msg)
+				return m, cmd
+
+			case "enter":
+				selectedTag := ""
+				if len(m.listTags.Items()) > 0 && m.listTags.SelectedItem() != nil {
+					if i, ok := m.listTags.SelectedItem().(item); ok {
+						selectedTag = string(i)
+					}
+				} else {
+					selectedTag = strings.TrimSpace(m.inputTag.Value())
+				}
+
+				if selectedTag == "" && m.inputTag.Value() != "" {
+					selectedTag = strings.TrimSpace(m.inputTag.Value())
+				}
+
+				if selectedTag != "" {
+					exists := false
+					for _, t := range m.tempTags {
+						if t == selectedTag {
+							exists = true
+						}
+					}
+					if !exists {
+						m.tempTags = append(m.tempTags, selectedTag)
+					}
+				}
+
+				m.state = viewPersonForm
+				m.inputName.Focus()
+				return m, nil
+			}
+
+			var cmdInput tea.Cmd
+			m.inputTag, cmdInput = m.inputTag.Update(msg)
+			m.updateTagListFilter()
+			return m, cmdInput
+		}
+
+	// ---------------------------------------------------------
+	// 5. CONFIRM DELETE
 	// ---------------------------------------------------------
 	case viewConfirmDeletePerson:
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
 			if msg.String() == "y" || msg.String() == "Y" {
-				// 1. Delete relations
 				newRels := []relation.Relation{}
 				for _, r := range m.db.Relations {
 					if r.FromID != m.selectedPerson.ID && r.ToID != m.selectedPerson.ID {
@@ -327,8 +432,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 				m.db.Relations = newRels
-
-				// 2. Delete person
 				newPeople := []person.Person{}
 				for _, p := range m.db.People {
 					if p.ID != m.selectedPerson.ID {
@@ -336,7 +439,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 				m.db.People = newPeople
-
 				saveData(m.db, m.dbPath)
 				m.listPeople.SetItems(peopleToItems(m.db.People))
 				m.state = viewListPeople
@@ -347,20 +449,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	// ---------------------------------------------------------
-	// 5. RELATION TARGET SELECT
+	// 6. RELATION STUFF
 	// ---------------------------------------------------------
 	case viewRelationTarget:
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
 			if msg.String() == "esc" {
 				m.state = viewDetail
-				m.listPeople.Title = "People" // Reset title
+				m.listPeople.Title = "People"
 				return m, nil
 			}
 			if msg.String() == "enter" {
 				if i, ok := m.listPeople.SelectedItem().(person.Person); ok {
 					if i.ID == m.selectedPerson.ID {
-						// Can't link to self
 						return m, nil
 					}
 					m.targetPerson = &i
@@ -377,9 +478,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.listPeople, cmd = m.listPeople.Update(msg)
 		return m, cmd
 
-	// ---------------------------------------------------------
-	// 6. RELATION FORM
-	// ---------------------------------------------------------
 	case viewRelationForm:
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
@@ -402,8 +500,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.inputRelDesc.Focus()
 					return m, nil
 				}
-
-				// Validate Strength
 				strVal, _ := strconv.Atoi(m.inputRelStr.Value())
 				if strVal < 1 {
 					strVal = 1
@@ -411,9 +507,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				if strVal > 5 {
 					strVal = 5
 				}
-
 				if m.isEditing {
-					// Update existing relation
 					for i, r := range m.db.Relations {
 						if r.ID == m.selectedRel.ID {
 							m.db.Relations[i].Strength = strVal
@@ -422,7 +516,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 					}
 				} else {
-					// Create new relation
 					newRel := relation.Relation{
 						ID:          uuid.New().String(),
 						FromID:      m.selectedPerson.ID,
@@ -435,7 +528,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				saveData(m.db, m.dbPath)
 				m.refreshRelationList()
 				m.state = viewDetail
-				m.listPeople.Title = "People" // Reset Title if we came from target select
+				m.listPeople.Title = "People"
 				return m, nil
 			}
 		}
@@ -444,9 +537,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.inputRelDesc, cmdDesc = m.inputRelDesc.Update(msg)
 		return m, tea.Batch(cmdStr, cmdDesc)
 
-	// ---------------------------------------------------------
-	// 7. CONFIRM DELETE RELATION
-	// ---------------------------------------------------------
 	case viewConfirmDeleteRelation:
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
@@ -484,17 +574,19 @@ func (m model) View() string {
 		if m.selectedPerson == nil {
 			return "Error: No person selected."
 		}
-		// Header Info
+		tagBlock := ""
+		if len(m.selectedPerson.Tags) > 0 {
+			for _, t := range m.selectedPerson.Tags {
+				tagBlock += tagStyle.Render("#" + t)
+			}
+			tagBlock += "\n\n"
+		}
 		s := titleStyle.Render(m.selectedPerson.Name) + "\n"
 		s += infoStyle.Render(m.selectedPerson.Notes) + "\n\n"
-
-		// Commands Help
-		help := infoStyle.Render("E: Edit Person | D: Delete Person | n: New Rel | e: Edit Rel | d: Del Rel | ESC: Back")
-
+		s += tagBlock
+		help := infoStyle.Render("E: Edit Person | D: Delete Person | Ctrl+g: Tags | n: New Rel | e: Edit Rel | d: Del Rel | ESC: Back")
 		s += help + "\n\n"
 		s += lipgloss.NewStyle().Underline(true).Render("Connections:") + "\n"
-
-		// The list view handles the rendering of the items
 		s += m.listRelations.View()
 		return docStyle.Render(s)
 
@@ -503,19 +595,42 @@ func (m model) View() string {
 		if m.isEditing {
 			title = "Edit Person"
 		}
-
+		tagsStr := ""
+		for _, t := range m.tempTags {
+			tagsStr += tagStyle.Render("#" + t)
+		}
+		if tagsStr == "" {
+			tagsStr = infoStyle.Render("(No tags - Press Ctrl+g to add)")
+		}
 		return docStyle.Render(fmt.Sprintf(
-			"%s\n\nName:\n%s\n\nNotes:\n%s\n\n%s",
+			"%s\n\nName:\n%s\n\nNotes:\n%s\n\nTags:\n%s\n\n%s",
 			titleStyle.Render(title),
 			m.inputName.View(),
 			m.inputNotes.View(),
-			infoStyle.Render("Enter on Notes to Save"),
+			tagsStr,
+			infoStyle.Render("Enter on Notes to Save | Ctrl+g: Manage Tags"),
+		))
+
+	case viewTagSelect:
+		listView := m.listTags.View()
+		// Wir entfernen die "empty check" hier, weil die Liste jetzt korrekt rendert,
+		// auch wenn sie leer ist (dann halt leer).
+		if len(m.listTags.Items()) == 0 {
+			listView = infoStyle.Render("(No existing tags found - Type to create new)")
+		}
+
+		return docStyle.Render(fmt.Sprintf(
+			"%s\n\n%s\n\n%s\n%s",
+			titleStyle.Render("Manage Tags"),
+			m.inputTag.View(),
+			infoStyle.Render("Existing Tags:"),
+			listView,
 		))
 
 	case viewRelationForm:
+		// ... (wie gehabt)
 		targetName := ""
 		if m.isEditing {
-			// Find the other person's name for display
 			otherID := m.selectedRel.ToID
 			if otherID == m.selectedPerson.ID {
 				otherID = m.selectedRel.FromID
@@ -524,7 +639,6 @@ func (m model) View() string {
 		} else {
 			targetName = m.targetPerson.Name
 		}
-
 		return docStyle.Render(fmt.Sprintf(
 			"Connection with %s\n\nStrength (1-5):\n%s\n\nDescription:\n%s\n\n%s",
 			titleStyle.Render(targetName),
@@ -534,27 +648,73 @@ func (m model) View() string {
 		))
 
 	case viewConfirmDeletePerson:
-		return docStyle.Render(fmt.Sprintf(
-			"\n%s\n\n%s\n\n(y/n)",
-			warnStyle.Render("WARNING"),
-			"Do you really want to delete this person?\nAll connections to them will also be deleted.",
-		))
-
+		return docStyle.Render(fmt.Sprintf("\n%s\n\n%s\n\n(y/n)", warnStyle.Render("WARNING"), "Do you really want to delete this person?"))
 	case viewConfirmDeleteRelation:
-		return docStyle.Render(fmt.Sprintf(
-			"\n%s\n\n%s\n\n(y/n)",
-			warnStyle.Render("DELETE CONNECTION"),
-			"Do you really want to delete this connection?",
-		))
+		return docStyle.Render(fmt.Sprintf("\n%s\n\n%s\n\n(y/n)", warnStyle.Render("DELETE CONNECTION"), "Do you really want to delete this connection?"))
 	}
 	return ""
 }
 
 // --- HELPER FUNCTIONS ---
 
+type item string
+
+func (i item) FilterValue() string { return string(i) }
+
+// FIX: Title und Description implementieren, damit der DefaultDelegate was anzeigen kann
+func (i item) Title() string       { return string(i) }
+func (i item) Description() string { return "" }
+
+func (m *model) updateTagListFilter() {
+	term := strings.ToLower(strings.TrimSpace(m.inputTag.Value()))
+
+	// 1. Tags aus DB holen
+	dbTags := getAllUniqueTags(m.db.People)
+
+	// 2. Map erstellen
+	tagMap := make(map[string]bool)
+	for _, loopItem := range dbTags {
+		tagMap[string(loopItem.(item))] = true
+	}
+
+	// 3. Temp-Tags hinzufügen
+	for _, t := range m.tempTags {
+		tagMap[t] = true
+	}
+
+	// 4. Filtern
+	items := []list.Item{}
+	for t := range tagMap {
+		if term == "" || strings.Contains(strings.ToLower(t), term) {
+			items = append(items, item(t))
+		}
+	}
+
+	// Sortieren
+	sort.Slice(items, func(i, j int) bool {
+		return string(items[i].(item)) < string(items[j].(item))
+	})
+
+	m.listTags.SetItems(items)
+	m.listTags.ResetSelected()
+}
+
+func getAllUniqueTags(people []person.Person) []list.Item {
+	tagMap := make(map[string]bool)
+	for _, p := range people {
+		for _, t := range p.Tags {
+			tagMap[t] = true
+		}
+	}
+	items := []list.Item{}
+	for t := range tagMap {
+		items = append(items, item(t))
+	}
+	return items
+}
+
 func (m *model) refreshRelationList() {
 	items := []list.Item{}
-
 	for _, r := range m.db.Relations {
 		if r.FromID == m.selectedPerson.ID || r.ToID == m.selectedPerson.ID {
 			otherID := r.ToID
@@ -563,7 +723,6 @@ func (m *model) refreshRelationList() {
 				otherID = r.FromID
 				direction = "<-"
 			}
-
 			items = append(items, relation.RelationItem{
 				Rel:       r,
 				OtherName: getName(m.db.People, otherID),
@@ -592,7 +751,6 @@ func peopleToItems(people []person.Person) []list.Item {
 	return items
 }
 
-// FIX: Automatically add IDs to old relations that don't have one
 func loadData(dbPath string) db.Database {
 	f, err := os.Open(dbPath)
 	if err != nil {
@@ -603,7 +761,6 @@ func loadData(dbPath string) db.Database {
 	var database db.Database
 	json.Unmarshal(byteValue, &database)
 
-	// Migration: Ensure all relations have an ID
 	dirty := false
 	for i := range database.Relations {
 		if database.Relations[i].ID == "" {
@@ -611,11 +768,9 @@ func loadData(dbPath string) db.Database {
 			dirty = true
 		}
 	}
-	// If we fixed IDs, save back to disk immediately
 	if dirty {
 		saveData(database, dbPath)
 	}
-
 	return database
 }
 
@@ -625,23 +780,21 @@ func saveData(database db.Database, dbPath string) {
 }
 
 func main() {
-	// Parse Flags
 	dbFlag := flag.String("db", "", "Path to the database json file")
 	flag.Parse()
-
-	// Determine path
 	dbPath := *dbFlag
 	if dbPath == "" {
 		dbPath = getDefaultDBPath()
 	}
-
-	// Ensure directory exists
 	dir := filepath.Dir(dbPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		fmt.Printf("Error creating directory %s: %v\n", dir, err)
 		os.Exit(1)
 	}
-
+	if err := migration.RunMigrations(dbPath); err != nil {
+		fmt.Printf("Error running migrations: %v\n", err)
+		os.Exit(1)
+	}
 	fmt.Println("Saving to:", dbPath)
 	p := tea.NewProgram(initialModel(dbPath), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
