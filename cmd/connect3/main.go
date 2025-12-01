@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/list"
@@ -15,23 +16,50 @@ import (
 	"github.com/google/uuid"
 )
 
+// --- DATA MODEL ---
+
 type Person struct {
 	ID    string `json:"id"`
 	Name  string `json:"name"`
 	Notes string `json:"notes"`
 }
 
-// Implement list interfaces
+// Implement list.Item interface
 func (p Person) Title() string       { return p.Name }
 func (p Person) Description() string { return p.Notes }
 func (p Person) FilterValue() string { return p.Name }
 
 type Relation struct {
+	ID          string `json:"id"`
 	FromID      string `json:"from_id"`
 	ToID        string `json:"to_id"`
 	Strength    int    `json:"strength"` // 1-5
 	Description string `json:"description"`
 }
+
+// Wrapper for Relation to be used in bubbles/list
+type RelationItem struct {
+	Rel       Relation
+	OtherName string
+	Direction string // "->" or "<-"
+}
+
+func (r RelationItem) Title() string {
+	icon := "⚪"
+	switch r.Rel.Strength {
+	case 2:
+		icon = "🔵"
+	case 3:
+		icon = "🟢"
+	case 4:
+		icon = "🟡"
+	case 5:
+		icon = "🔴"
+	}
+	return fmt.Sprintf("%s %s %s (%d/5)", icon, r.Direction, r.OtherName, r.Rel.Strength)
+}
+func (r RelationItem) Description() string { return r.Rel.Description }
+func (r RelationItem) FilterValue() string { return r.OtherName + " " + r.Rel.Description }
 
 type Database struct {
 	People    []Person   `json:"people"`
@@ -40,91 +68,101 @@ type Database struct {
 
 const dbFileName = "data.json"
 
+// --- STYLING ---
+
 var (
-	docStyle      = lipgloss.NewStyle().Margin(1, 2)
-	titleStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true)
-	infoStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-	strengthStyle = func(s int) string {
-		switch s {
-		case 1:
-			return "⚪ Flüchtig (1)"
-		case 2:
-			return "🔵 Bekannt (2)"
-		case 3:
-			return "🟢 Gut Bekannt (3)"
-		case 4:
-			return "🟡 Freund (4)"
-		case 5:
-			return "🔴 Eng verbunden (5)"
-		default:
-			return "?"
-		}
-	}
+	docStyle   = lipgloss.NewStyle().Margin(1, 2)
+	titleStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true)
+	infoStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
+	warnStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("196")).Bold(true) // Red
 )
+
+// --- APPLICATION STATES ---
 
 type sessionState int
 
 const (
-	viewList sessionState = iota
+	viewListPeople sessionState = iota
 	viewDetail
-	viewCreatePerson
-	viewCreateRelationSelectTarget
-	viewCreateRelationDetails
+	viewPersonForm     // Used for Create and Edit
+	viewRelationTarget // Select who to connect to
+	viewRelationForm   // Used for Create and Edit
+	viewConfirmDeletePerson
+	viewConfirmDeleteRelation
 )
 
+// --- MAIN MODEL ---
+
 type model struct {
-	state    sessionState
-	db       Database
-	list     list.Model
-	selected *Person // The currently viewed person
+	state sessionState
+	db    Database
 
-	inputName  textinput.Model
-	inputNotes textarea.Model
+	// Lists
+	listPeople    list.Model
+	listRelations list.Model // Embedded in Detail View
 
-	relTarget    *Person // Who should be connected
+	// Selections
+	selectedPerson *Person
+	selectedRel    *Relation
+	targetPerson   *Person // For creating new relations
+
+	// Forms
+	isEditing    bool // Are we creating or editing?
+	inputName    textinput.Model
+	inputNotes   textarea.Model
 	inputRelDesc textinput.Model
-	inputRelStr  textinput.Model // Input 1 to 5
+	inputRelStr  textinput.Model
 }
 
 func initialModel() model {
 	db := loadData()
 
+	// 1. Init People List
 	items := make([]list.Item, len(db.People))
 	for i, p := range db.People {
 		items[i] = p
 	}
-
 	l := list.New(items, list.NewDefaultDelegate(), 0, 0)
-	l.Title = "Mein Privates CRM"
+	l.Title = "People"
 	l.AdditionalShortHelpKeys = func() []key.Binding {
 		return []key.Binding{
-			key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "Neu")),
+			key.NewBinding(key.WithKeys("n"), key.WithHelp("n", "New Person")),
 		}
 	}
 
+	// 2. Init Relation List (Initially empty)
+	lr := list.New([]list.Item{}, list.NewDefaultDelegate(), 0, 0)
+	lr.Title = "Connections"
+	lr.SetShowTitle(false)
+	lr.SetFilteringEnabled(false) // Disable filter in detail view to keep it clean
+	lr.SetShowHelp(false)         // We show custom help in view
+	lr.SetShowStatusBar(false)    // Minimalist look
+	lr.DisableQuitKeybindings()
+
+	// 3. Init Inputs
 	ti := textinput.New()
-	ti.Placeholder = "Name der Person"
-	ti.Focus()
+	ti.Placeholder = "Full Name"
 
 	ta := textarea.New()
-	ta.Placeholder = "Notizen..."
+	ta.Placeholder = "Notes..."
 	ta.SetHeight(3)
 
-	tiRel := textinput.New()
-	tiRel.Placeholder = "Beschreibung (z.B. Kennengelernt beim Sport)"
+	tiRelDesc := textinput.New()
+	tiRelDesc.Placeholder = "Description (e.g. Work Colleague)"
 
-	tiStr := textinput.New()
-	tiStr.Placeholder = "Stärke (1-5)"
-	tiStr.CharLimit = 1
+	tiRelStr := textinput.New()
+	tiRelStr.Placeholder = "Strength (1-5)"
+	tiRelStr.CharLimit = 1
 
 	return model{
-		state:        viewList,
-		db:           db,
-		list:         l,
-		inputName:    ti,
-		inputNotes:   ta,
-		inputRelDesc: tiRel,
-		inputRelStr:  tiStr,
+		state:         viewListPeople,
+		db:            db,
+		listPeople:    l,
+		listRelations: lr,
+		inputName:     ti,
+		inputNotes:    ta,
+		inputRelDesc:  tiRelDesc,
+		inputRelStr:   tiRelStr,
 	}
 }
 
@@ -132,56 +170,125 @@ func (m model) Init() tea.Cmd {
 	return nil
 }
 
+// --- UPDATE ---
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 
-	switch m.state {
-	case viewList:
-		switch msg := msg.(type) {
-		case tea.KeyMsg:
-			if msg.String() == "n" && !m.list.SettingFilter() {
-				m.state = viewCreatePerson
-				m.inputName.Focus()
-				m.inputName.SetValue("")
-				m.inputNotes.SetValue("")
-				return m, nil
-			}
-			if msg.String() == "enter" {
-				if i, ok := m.list.SelectedItem().(Person); ok {
-					m.selected = &i
-					m.state = viewDetail
-				}
-				return m, nil
-			}
-		case tea.WindowSizeMsg:
-			h, v := docStyle.GetFrameSize()
-			m.list.SetSize(msg.Width-h, msg.Height-v)
-		}
-		m.list, cmd = m.list.Update(msg)
-		return m, cmd
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		// CRITICAL FIX: Update sizes for BOTH lists regardless of current view
+		h, v := docStyle.GetFrameSize()
+		m.listPeople.SetSize(msg.Width-h, msg.Height-v)
 
-	case viewDetail:
+		// Relations list is smaller (subtract header space approx 10 lines)
+		relHeight := msg.Height - v - 12
+		if relHeight < 5 {
+			relHeight = 5
+		}
+		m.listRelations.SetSize(msg.Width-h, relHeight)
+	}
+
+	switch m.state {
+
+	// ---------------------------------------------------------
+	// 1. MAIN PEOPLE LIST
+	// ---------------------------------------------------------
+	case viewListPeople:
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
 			switch msg.String() {
-			case "esc", "q":
-				m.state = viewList
-				m.selected = nil
+			case "n":
+				m.state = viewPersonForm
+				m.isEditing = false
+				m.inputName.SetValue("")
+				m.inputNotes.SetValue("")
+				m.inputName.Focus()
 				return m, nil
-			case "r":
-				m.state = viewCreateRelationSelectTarget
-				m.list.Title = "Wähle eine Verbindung für " + m.selected.Name
-				m.list.ResetSelected()
+			case "enter":
+				if i, ok := m.listPeople.SelectedItem().(Person); ok {
+					m.selectedPerson = &i
+					m.state = viewDetail
+					// Refresh relation list items
+					m.refreshRelationList()
+				}
 				return m, nil
 			}
 		}
+		m.listPeople, cmd = m.listPeople.Update(msg)
+		return m, cmd
 
-	case viewCreatePerson:
+	// ---------------------------------------------------------
+	// 2. DETAIL VIEW (Contains Info + Relations List)
+	// ---------------------------------------------------------
+	case viewDetail:
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			// Global Detail Keys
+			switch msg.String() {
+			case "esc", "backspace":
+				m.state = viewListPeople
+				m.selectedPerson = nil
+				return m, nil
+			case "E": // Shift+e to edit Person
+				m.state = viewPersonForm
+				m.isEditing = true
+				m.inputName.SetValue(m.selectedPerson.Name)
+				m.inputNotes.SetValue(m.selectedPerson.Notes)
+				m.inputName.Focus()
+				return m, nil
+			case "D": // Shift+d to delete Person
+				m.state = viewConfirmDeletePerson
+				return m, nil
+
+			// Relation List Keys
+			case "n":
+				// Add new relation
+				m.state = viewRelationTarget
+				m.listPeople.Title = "Select person to connect with " + m.selectedPerson.Name
+				m.listPeople.ResetSelected()
+				return m, nil
+			case "e":
+				// Edit selected relation
+				if len(m.listRelations.Items()) > 0 {
+					if i, ok := m.listRelations.SelectedItem().(RelationItem); ok {
+						m.selectedRel = &i.Rel
+						m.state = viewRelationForm
+						m.isEditing = true
+						m.inputRelDesc.SetValue(i.Rel.Description)
+						m.inputRelStr.SetValue(fmt.Sprintf("%d", i.Rel.Strength))
+						m.inputRelStr.Focus()
+					}
+				}
+				return m, nil
+			case "d":
+				// Delete selected relation
+				if len(m.listRelations.Items()) > 0 {
+					if i, ok := m.listRelations.SelectedItem().(RelationItem); ok {
+						m.selectedRel = &i.Rel
+						m.state = viewConfirmDeleteRelation
+					}
+				}
+				return m, nil
+			}
+		}
+		// Forward keys to the relations list (navigation)
+		m.listRelations, cmd = m.listRelations.Update(msg)
+		return m, cmd
+
+	// ---------------------------------------------------------
+	// 3. PERSON FORM (Create / Edit)
+	// ---------------------------------------------------------
+	case viewPersonForm:
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
 			switch msg.String() {
 			case "esc":
-				m.state = viewList
+				if m.isEditing {
+					m.state = viewDetail
+				} else {
+					m.state = viewListPeople
+				}
 				return m, nil
 			case "tab":
 				if m.inputName.Focused() {
@@ -197,16 +304,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.inputNotes.Focus()
 					return m, nil
 				}
-				newP := Person{
-					ID:    uuid.New().String(),
-					Name:  m.inputName.Value(),
-					Notes: m.inputNotes.Value(),
+				// Save Logic
+				if m.isEditing {
+					// Update existing
+					for i, p := range m.db.People {
+						if p.ID == m.selectedPerson.ID {
+							m.db.People[i].Name = m.inputName.Value()
+							m.db.People[i].Notes = m.inputNotes.Value()
+							m.selectedPerson = &m.db.People[i] // Update pointer
+							break
+						}
+					}
+				} else {
+					// Create new
+					newP := Person{
+						ID:    uuid.New().String(),
+						Name:  m.inputName.Value(),
+						Notes: m.inputNotes.Value(),
+					}
+					m.db.People = append(m.db.People, newP)
 				}
-				m.db.People = append(m.db.People, newP)
 				saveData(m.db)
-				cmd = m.list.SetItems(peopleToItems(m.db.People))
-				m.state = viewList
-				return m, cmd
+				m.listPeople.SetItems(peopleToItems(m.db.People))
+
+				if m.isEditing {
+					m.state = viewDetail
+				} else {
+					m.state = viewListPeople
+				}
+				return m, nil
 			}
 		}
 		var cmdName, cmdNotes tea.Cmd
@@ -214,21 +340,60 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.inputNotes, cmdNotes = m.inputNotes.Update(msg)
 		return m, tea.Batch(cmdName, cmdNotes)
 
-	case viewCreateRelationSelectTarget:
+	// ---------------------------------------------------------
+	// 4. CONFIRM DELETE PERSON
+	// ---------------------------------------------------------
+	case viewConfirmDeletePerson:
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			if msg.String() == "y" || msg.String() == "Y" {
+				// 1. Delete relations
+				newRels := []Relation{}
+				for _, r := range m.db.Relations {
+					if r.FromID != m.selectedPerson.ID && r.ToID != m.selectedPerson.ID {
+						newRels = append(newRels, r)
+					}
+				}
+				m.db.Relations = newRels
+
+				// 2. Delete person
+				newPeople := []Person{}
+				for _, p := range m.db.People {
+					if p.ID != m.selectedPerson.ID {
+						newPeople = append(newPeople, p)
+					}
+				}
+				m.db.People = newPeople
+
+				saveData(m.db)
+				m.listPeople.SetItems(peopleToItems(m.db.People))
+				m.state = viewListPeople
+				m.selectedPerson = nil
+			} else if msg.String() == "n" || msg.String() == "N" || msg.String() == "esc" {
+				m.state = viewDetail
+			}
+		}
+
+	// ---------------------------------------------------------
+	// 5. RELATION TARGET SELECT
+	// ---------------------------------------------------------
+	case viewRelationTarget:
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
 			if msg.String() == "esc" {
 				m.state = viewDetail
-				m.list.Title = "Mein Privates CRM" // Reset Title
+				m.listPeople.Title = "People" // Reset title
 				return m, nil
 			}
 			if msg.String() == "enter" {
-				if i, ok := m.list.SelectedItem().(Person); ok {
-					if i.ID == m.selected.ID {
+				if i, ok := m.listPeople.SelectedItem().(Person); ok {
+					if i.ID == m.selectedPerson.ID {
+						// Can't link to self
 						return m, nil
 					}
-					m.relTarget = &i
-					m.state = viewCreateRelationDetails
+					m.targetPerson = &i
+					m.state = viewRelationForm
+					m.isEditing = false
 					m.inputRelStr.Focus()
 					m.inputRelStr.SetValue("")
 					m.inputRelDesc.SetValue("")
@@ -236,15 +401,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		}
-		m.list, cmd = m.list.Update(msg)
+		m.listPeople, cmd = m.listPeople.Update(msg)
 		return m, cmd
 
-	case viewCreateRelationDetails:
+	// ---------------------------------------------------------
+	// 6. RELATION FORM
+	// ---------------------------------------------------------
+	case viewRelationForm:
 		switch msg := msg.(type) {
 		case tea.KeyMsg:
 			switch msg.String() {
 			case "esc":
 				m.state = viewDetail
+				m.listPeople.Title = "People"
 				return m, nil
 			case "tab":
 				if m.inputRelStr.Focused() {
@@ -260,8 +429,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.inputRelDesc.Focus()
 					return m, nil
 				}
-				strVal := 1
-				fmt.Sscanf(m.inputRelStr.Value(), "%d", &strVal)
+
+				// Validate Strength
+				strVal, _ := strconv.Atoi(m.inputRelStr.Value())
 				if strVal < 1 {
 					strVal = 1
 				}
@@ -269,17 +439,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					strVal = 5
 				}
 
-				newRel := Relation{
-					FromID:      m.selected.ID,
-					ToID:        m.relTarget.ID,
-					Strength:    strVal,
-					Description: m.inputRelDesc.Value(),
+				if m.isEditing {
+					// Update existing relation
+					for i, r := range m.db.Relations {
+						if r.ID == m.selectedRel.ID {
+							m.db.Relations[i].Strength = strVal
+							m.db.Relations[i].Description = m.inputRelDesc.Value()
+							break
+						}
+					}
+				} else {
+					// Create new relation
+					newRel := Relation{
+						ID:          uuid.New().String(),
+						FromID:      m.selectedPerson.ID,
+						ToID:        m.targetPerson.ID,
+						Strength:    strVal,
+						Description: m.inputRelDesc.Value(),
+					}
+					m.db.Relations = append(m.db.Relations, newRel)
 				}
-				m.db.Relations = append(m.db.Relations, newRel)
 				saveData(m.db)
-
+				m.refreshRelationList()
 				m.state = viewDetail
-				m.list.Title = "Mein Privates CRM"
+				m.listPeople.Title = "People" // Reset Title if we came from target select
 				return m, nil
 			}
 		}
@@ -287,87 +470,145 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.inputRelStr, cmdStr = m.inputRelStr.Update(msg)
 		m.inputRelDesc, cmdDesc = m.inputRelDesc.Update(msg)
 		return m, tea.Batch(cmdStr, cmdDesc)
+
+	// ---------------------------------------------------------
+	// 7. CONFIRM DELETE RELATION
+	// ---------------------------------------------------------
+	case viewConfirmDeleteRelation:
+		switch msg := msg.(type) {
+		case tea.KeyMsg:
+			if msg.String() == "y" || msg.String() == "Y" {
+				newRels := []Relation{}
+				for _, r := range m.db.Relations {
+					if r.ID != m.selectedRel.ID {
+						newRels = append(newRels, r)
+					}
+				}
+				m.db.Relations = newRels
+				saveData(m.db)
+				m.refreshRelationList()
+				m.state = viewDetail
+			} else if msg.String() == "n" || msg.String() == "N" || msg.String() == "esc" {
+				m.state = viewDetail
+			}
+		}
 	}
 
 	return m, nil
 }
 
+// --- VIEW ---
+
 func (m model) View() string {
 	switch m.state {
-	case viewList, viewCreateRelationSelectTarget:
-		return docStyle.Render(m.list.View())
+	case viewListPeople:
+		return docStyle.Render(m.listPeople.View())
+
+	case viewRelationTarget:
+		return docStyle.Render(m.listPeople.View())
 
 	case viewDetail:
-		if m.selected == nil {
-			return "Fehler: Keine Person ausgewählt"
+		if m.selectedPerson == nil {
+			return "Error: No person selected."
 		}
-		s := titleStyle.Render(m.selected.Name) + "\n"
-		s += infoStyle.Render(m.selected.Notes) + "\n\n"
-		s += lipgloss.NewStyle().Underline(true).Render("Verbindungen:") + "\n"
+		// Header Info
+		s := titleStyle.Render(m.selectedPerson.Name) + "\n"
+		s += infoStyle.Render(m.selectedPerson.Notes) + "\n\n"
 
-		found := false
-		for _, r := range m.db.Relations {
-			if r.FromID == m.selected.ID || r.ToID == m.selected.ID {
-				found = true
-				otherID := r.ToID
-				direction := "->"
-				if r.ToID == m.selected.ID {
-					otherID = r.FromID
-					direction = "<-"
-				}
-				otherName := getName(m.db.People, otherID)
+		// Commands Help
+		help := infoStyle.Render("E: Edit Person | D: Delete Person | n: New Rel | e: Edit Rel | d: Del Rel | ESC: Back")
 
-				line := fmt.Sprintf("%s %s %s [%s]",
-					strengthStyle(r.Strength),
-					direction,
-					otherName,
-					r.Description,
-				)
-				s += line + "\n"
-			}
-		}
-		if !found {
-			s += infoStyle.Render("Keine Verbindungen eingetragen.") + "\n"
-		}
+		s += help + "\n\n"
+		s += lipgloss.NewStyle().Underline(true).Render("Connections:") + "\n"
 
-		s += "\n\n" + infoStyle.Render("ESC: Zurück | r: Neue Verbindung hinzufügen")
+		// The list view handles the rendering of the items
+		s += m.listRelations.View()
 		return docStyle.Render(s)
 
-	case viewCreatePerson:
+	case viewPersonForm:
+		title := "Create New Person"
+		if m.isEditing {
+			title = "Edit Person"
+		}
+
 		return docStyle.Render(fmt.Sprintf(
-			"Neue Person anlegen\n\n%s\n\n%s\n\n%s",
+			"%s\n\nName:\n%s\n\nNotes:\n%s\n\n%s",
+			titleStyle.Render(title),
 			m.inputName.View(),
 			m.inputNotes.View(),
-			infoStyle.Render("Enter zum Speichern in Notizen"),
+			infoStyle.Render("Enter on Notes to Save"),
 		))
 
-	case viewCreateRelationDetails:
+	case viewRelationForm:
+		targetName := ""
+		if m.isEditing {
+			// Find the other person's name for display
+			otherID := m.selectedRel.ToID
+			if otherID == m.selectedPerson.ID {
+				otherID = m.selectedRel.FromID
+			}
+			targetName = getName(m.db.People, otherID)
+		} else {
+			targetName = m.targetPerson.Name
+		}
+
 		return docStyle.Render(fmt.Sprintf(
-			"Verbindung zu %s definieren\n\nStärke (1-5):\n%s\n\nBeschreibung:\n%s\n\n%s",
-			m.relTarget.Name,
+			"Connection with %s\n\nStrength (1-5):\n%s\n\nDescription:\n%s\n\n%s",
+			titleStyle.Render(targetName),
 			m.inputRelStr.View(),
 			m.inputRelDesc.View(),
-			infoStyle.Render("Enter zum Speichern"),
+			infoStyle.Render("Enter on Description to Save"),
+		))
+
+	case viewConfirmDeletePerson:
+		return docStyle.Render(fmt.Sprintf(
+			"\n%s\n\n%s\n\n(y/n)",
+			warnStyle.Render("WARNING"),
+			"Do you really want to delete this person?\nAll connections to them will also be deleted.",
+		))
+
+	case viewConfirmDeleteRelation:
+		return docStyle.Render(fmt.Sprintf(
+			"\n%s\n\n%s\n\n(y/n)",
+			warnStyle.Render("DELETE CONNECTION"),
+			"Do you really want to delete this connection?",
 		))
 	}
 	return ""
 }
 
-func loadData() Database {
-	f, err := os.Open(dbFileName)
-	if err != nil {
-		return Database{People: []Person{}, Relations: []Relation{}}
+// --- HELPER FUNCTIONS ---
+
+func (m *model) refreshRelationList() {
+	items := []list.Item{}
+
+	for _, r := range m.db.Relations {
+		if r.FromID == m.selectedPerson.ID || r.ToID == m.selectedPerson.ID {
+			otherID := r.ToID
+			direction := "->"
+			if r.ToID == m.selectedPerson.ID {
+				otherID = r.FromID
+				direction = "<-"
+			}
+
+			items = append(items, RelationItem{
+				Rel:       r,
+				OtherName: getName(m.db.People, otherID),
+				Direction: direction,
+			})
+		}
 	}
-	defer f.Close()
-	byteValue, _ := io.ReadAll(f)
-	var db Database
-	json.Unmarshal(byteValue, &db)
-	return db
+	m.listRelations.SetItems(items)
+	m.listRelations.ResetSelected()
 }
 
-func saveData(db Database) {
-	file, _ := json.MarshalIndent(db, "", " ")
-	_ = os.WriteFile(dbFileName, file, 0644)
+func getName(people []Person, id string) string {
+	for _, p := range people {
+		if p.ID == id {
+			return p.Name
+		}
+	}
+	return "Unknown"
 }
 
 func peopleToItems(people []Person) []list.Item {
@@ -378,19 +619,42 @@ func peopleToItems(people []Person) []list.Item {
 	return items
 }
 
-func getName(people []Person, id string) string {
-	for _, p := range people {
-		if p.ID == id {
-			return p.Name
+// FIX: Automatically add IDs to old relations that don't have one
+func loadData() Database {
+	f, err := os.Open(dbFileName)
+	if err != nil {
+		return Database{People: []Person{}, Relations: []Relation{}}
+	}
+	defer f.Close()
+	byteValue, _ := io.ReadAll(f)
+	var db Database
+	json.Unmarshal(byteValue, &db)
+
+	// Migration: Ensure all relations have an ID
+	dirty := false
+	for i := range db.Relations {
+		if db.Relations[i].ID == "" {
+			db.Relations[i].ID = uuid.New().String()
+			dirty = true
 		}
 	}
-	return "Unbekannt"
+	// If we fixed IDs, save back to disk immediately
+	if dirty {
+		saveData(db)
+	}
+
+	return db
+}
+
+func saveData(db Database) {
+	file, _ := json.MarshalIndent(db, "", " ")
+	_ = os.WriteFile(dbFileName, file, 0644)
 }
 
 func main() {
 	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
-		fmt.Printf("Fehler: %v", err)
+		fmt.Printf("Error: %v", err)
 		os.Exit(1)
 	}
 }
